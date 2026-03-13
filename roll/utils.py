@@ -240,6 +240,10 @@ def get_local_data_date(provider_uri):
     _, stdout, _ = run_command(f"tail -n 1 {provider_uri}/calendars/day.txt")
     return stdout
 
+def get_trade_data(provider_uri):
+    _, stdout, _ = run_command(f"cat {provider_uri}/calendars/day.txt")
+    return stdout.split("\n")
+
 def fix_mlflow_paths(mlruns_dir: Optional[str] = None):
     """精准修复 MLflow 配置文件中的用户路径"""
     current_home = str(Path.home())

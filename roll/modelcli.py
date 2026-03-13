@@ -1,8 +1,9 @@
 from loguru import logger
 from tabulate import tabulate
-from utils import check_match_in_list, append_to_file, get_normalized_stock_list, filter_csv
+from utils import check_match_in_list, append_to_file, get_normalized_stock_list, filter_csv, get_local_data_date, get_trade_data
 import numpy as np
 import pandas as pd
+import re
 import sys
 import qlib
 from qlib.constant import REG_CN
@@ -312,8 +313,9 @@ class ModelCLI:
         df = df[(df['ROC10'] > 0.80) & (df['ROC20'] > 0.80) & (df['ROC60'] > 0.80)]
         return df[df['ROC20'] < 1.30]
 
-    def get_real_label(self):
-        dates = self.kwargs['predict_dates'][0]
+    def get_real_label(self, dates = None):
+        if dates is None:
+            dates = self.kwargs['predict_dates'][0]
         df = D.features(D.instruments('all'), ['Ref($close, -2)/Ref($close, -1) - 1'], start_time=dates['start'], end_time=dates['end'], freq='day')
         df.columns = ['real_label']
         return df
@@ -366,3 +368,112 @@ class ModelCLI:
                 tar.extractall(path=TARGET_PARENT)
 
         print("✅ 恢复完成。")
+
+    def _review_csv(self, df, real_df):
+        df = df[df["avg_score"] > 0].copy()  # 避免 SettingWithCopyWarning
+        real_map = real_df.drop_duplicates('instrument').set_index('instrument')['real_label']
+        df['real_label'] = df['instrument'].map(real_map)
+
+        df['error'] = df['avg_score'] - df['real_label']
+        df['abs_error'] = df['error'].abs()
+
+        # 统计 real_label > 0 的数量与比例
+        positive_count = (df['real_label'] > 0).sum()
+        zero_count = (df['real_label'] == 0).sum()
+        negative_count = (df['real_label'] < 0).sum()
+        total_count = len(df)
+        positive_ratio = positive_count / total_count if total_count > 0 else 0
+        print(f"real_label > 0 数量: {positive_count}，real_label == 0 数量: {zero_count}，real_label < 0 数量: {negative_count}，总数量: {total_count}，胜率: {positive_ratio:.2%}")
+
+    def _review_subdir(self, subdir):
+        print(f"- {subdir.name}")
+        # 优化：集中提取日期，减少冗余检查
+        date_str = next(
+            (
+                re.match(r"(\d{4}-\d{2}-\d{2})_.*\.csv", file.name).group(1)
+                for file in subdir.iterdir()
+                if file.is_file() and re.match(r"(\d{4}-\d{2}-\d{2})_.*\.csv", file.name)
+            ),
+            None,
+        )
+        if date_str:
+            print(f"  直接从文件名提取的日期: {date_str}")
+        else:
+            print("  未发现格式为 xxxx-xx-xx_ 的 CSV 文件名")
+
+        trade_data = get_trade_data(self.kwargs.get("provider_uri"))
+        if date_str and trade_data and date_str in trade_data[-2:]:
+            return
+
+        logger.info(f"  开始复盘 {date_str if date_str else '[未知日期]'}")
+        df_filter_ret, df_ret = None, None
+        if date_str:
+            filter_ret_path = subdir / f"{date_str}_filter_ret.csv"
+            ret_path = subdir / f"{date_str}_ret.csv"
+
+            # 读取 filter_ret
+            if filter_ret_path.exists():
+                try:
+                    df_filter_ret = pd.read_csv(filter_ret_path)
+                    print(f"  已读取: {filter_ret_path.name}, 行数: {len(df_filter_ret)}")
+                except Exception as e:
+                    print(f"  读取 {filter_ret_path.name} 出错: {e}")
+            else:
+                print(f"  未找到: {filter_ret_path.name}")
+
+            # 读取 ret
+            if ret_path.exists():
+                try:
+                    df_ret = pd.read_csv(ret_path)
+                    print(f"  已读取: {ret_path.name}, 行数: {len(df_ret)}")
+                except Exception as e:
+                    print(f"  读取 {ret_path.name} 出错: {e}")
+            else:
+                print(f"  未找到: {ret_path.name}")
+
+        real_df = self.get_real_label(dates={"start": date_str, "end": date_str})
+        real_df = real_df.reset_index()
+
+        # 删除 'KMID' 及其右侧所有表项（包含 KMID）
+        for name, df in [('df_ret', df_ret), ('df_filter_ret', df_filter_ret)]:
+            if df is not None and not df.empty:
+                if 'KMID' in df.columns:
+                    kmid_idx = df.columns.get_loc('KMID')
+                    # 只保留 KMID 左侧的所有列（不包含 KMID 本身）
+                    if name == 'df_ret':
+                        df_ret = df.iloc[:, :kmid_idx]
+                    else:
+                        df_filter_ret = df.iloc[:, :kmid_idx]
+                else:
+                    print(f"⚠️ {name} 中不存在 'KMID' 列，未做裁剪。")
+
+        print("分析 df_ret:")
+        self._review_csv(df_ret, real_df)
+        print("分析 df_filter_ret:")
+        self._review_csv(df_filter_ret, real_df)
+
+
+    def review(self):
+        """马后炮"""
+        base_dir = Path("../qlib_score_csv")
+        if not base_dir.exists() or not base_dir.is_dir():
+            print(f"⚠️ 目录不存在: {base_dir.resolve()}")
+            return
+
+        subdirs = [d for d in base_dir.iterdir() if d.is_dir()]
+        print(f"共发现 {len(subdirs)} 个子目录：")
+        # 按照日期从新到旧遍历
+        def extract_date(subdir):
+            import re
+            m = re.match(r"selection_(\d{8})_", subdir.name)
+            if m:
+                return m.group(1)
+            return ""  # 未识别返回空字符串，排在后面
+
+        sorted_subdirs = sorted(
+            subdirs,
+            key=lambda d: extract_date(d),
+            reverse=True  # 从新到旧
+        )
+        for subdir in sorted_subdirs:
+            self._review_subdir(subdir)
